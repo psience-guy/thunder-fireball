@@ -1,6 +1,6 @@
 ! copyright info:
 !
-!                             @Copyright 2022
+!                             @Copyright 2025
 !                           Fireball Committee
 ! Hong Kong Quantum AI Laboratory, Ltd. - James P. Lewis, Chair
 ! Universidad de Madrid - Jose Ortega
@@ -17,6 +17,7 @@
 ! University of Texas at Austin - Alex Demkov
 ! Ohio University - Dave Drabold
 ! Synfuels China Technology Co., Ltd. - Pengju Ren
+! Synfuels China Technology Co., Ltd. - Zhaofa Li
 ! Washington University - Pete Fedders
 ! West Virginia University - Ning Ma and Hao Wang
 ! also Gary Adams, Juergen Frisch, John Tomfohr, Kevin Schmidt,
@@ -82,9 +83,16 @@
         use M_Dassemble_usr
         use M_Dassemble_ewald
         use M_build_forces
-! /MD
-        use M_dynamics
 
+! /MD
+        use M_dynamics_settings
+
+! /NAMD
+        use M_nonadiabatic_mdet 
+
+! /OUTPUT
+        use M_writeout_file
+ 
 ! /SOLVESH
         use M_kspace
         use M_density_matrix
@@ -111,19 +119,18 @@
 ! Variable Declaration and Description
 ! ===========================================================================
         integer iatom                     !< counter over atoms and neighbors
-        integer in1
+        integer in1                     !< counter over atoms and neighbors
 
         integer iscf_iteration
         integer istructure, iseparate
         integer itime_step
 
-        integer nssh                        !< number of shells
-
+        real xmass
         real sigma                          !< difference for SCF
         real rms                            !< RMS of the forces
 
-        character (len = 25) :: slogfile
-        character (len = 25) :: sjsonfile
+        character (len = 256) :: slogfile
+        character (len = 256) :: sjsonfile
 
 ! --------------------------------------------------------------------------
 ! Socket communication
@@ -354,11 +361,11 @@
             stop
           end if
 
-!         ! SOCKET - GET POSITIONS
+
           if (ipi .eq. 1) then
             do while (.true.)
               call readbuffer (socket, header, msglen)
-
+              ! SOCKET - GET POSITIONS
               if (trim(header) .eq. "STATUS") then
                 call writebuffer (socket, "READY       ", msglen)
                 call readbuffer (socket, header, msglen)
@@ -375,13 +382,19 @@
                   end if
                   allocate (msgbuffer(3*s%natoms))
                   call readbuffer (socket, msgbuffer, 3*s%natoms)
-                  deallocate (msgbuffer)
+                  call readbuffer (socket, msgbuffer, 3*s%natoms)
+                  deallocate (msgbuffer)                  
                   exit
                 end if
               end if
             end do
           end if
-
+!NAC
+          write (s%logfile,*) ' Reading parameters from the structure.mdet input:  '
+          write (s%logfile,*) '  structures_mdet.inp'
+          write (s%logfile,*)
+          call initialize_mdet (s)
+          
 ! Molecular-dynamics loop
 ! ---------------------------------------------------------------------------
 ! All molecular-dynamics is done by ASE.
@@ -395,38 +408,10 @@
               write (s%jsonfile,'(A)') '},'
             end if
 
-            write (s%jsonfile,'(A)') '{'
-            write (s%jsonfile,'(A, I5, A)') '      "nstep":', itime_step, ','
-            write (s%jsonfile,'(A)') '      "cell":['
-            write (s%jsonfile,'(A, 2x, 3(F15.6, A), A)')                      &
-     &        '      [', s%lattice(1)%a(1), ',', s%lattice(1)%a(2), ',',      &
-     &                   s%lattice(1)%a(3),'],'
-            write (s%jsonfile,'(A, 2x, 3(F15.6, A), A)')                      &
-     &        '      [', s%lattice(2)%a(1), ',', s%lattice(2)%a(2), ',',      &
-     &                   s%lattice(2)%a(3),'],'
-            write (s%jsonfile,'(A, 2x, 3(F15.6, A), A)')                      &
-     &        '      [', s%lattice(3)%a(1), ',', s%lattice(3)%a(2), ',',      &
-     &                   s%lattice(3)%a(3),']],'
-
-            write (s%jsonfile,'(A)') '      "numbers":['
-            do iatom = 1, s%natoms - 1
-              in1 = s%atom(iatom)%imass
-              write (s%jsonfile,'(16x, i3, A)') species(in1)%nZ, ','
-            end do
-            in1 = s%atom(s%natoms)%imass
-            write (s%jsonfile,'(16x, i3, A)') species(in1)%nZ, '],'
-
-            write (s%jsonfile,'(A)') '      "positions":['
-            do iatom = 1, s%natoms - 1
-              write (s%jsonfile,'(A, 6x, 3(F15.6, A), A)')                    &
-     &          '      [', s%atom(iatom)%ratom(1), ',',                       &
-     &                     s%atom(iatom)%ratom(2), ',',                       &
-     &                     s%atom(iatom)%ratom(3),'],'
-            end do
-            write (s%jsonfile,'(A, 6x, 3(F15.6, A), A)')                      &
-     &        '      [', s%atom(s%natoms)%ratom(1), ',',                      &
-     &                   s%atom(s%natoms)%ratom(2), ',',                      &
-     &                   s%atom(s%natoms)%ratom(3),']],'
+            ! write out stuff to json file
+            call writeout_file_step_head (s, itime_step)
+            call writeout_file_cell (s, itime_step)
+            call writeout_file_atoms_number (s, itime_step)
 
             write (s%logfile, *)
             write (s%logfile, '(A, I5, A1, I5, A1)') 'Molecular-Dynamics Loop  Step: (', itime_step, '/', nstepf, ')'
@@ -553,73 +538,13 @@
             end do
 
 ! Write out the charges to .json file
-            write (s%jsonfile,'(A)') '      "charges":['
-            do iatom = 1, s%natoms - 1
-              in1 = s%atom(iatom)%imass
-              nssh = species(in1)%nssh
-              if (nssh .eq. 1) then
-                write (s%jsonfile,'(A, 6x, (F15.6, A), A)')                   &
-      &            '      [', s%atom(iatom)%shell(1)%Qin,'],'
-              else if (nssh .eq. 2) then
-                write (s%jsonfile,'(A, 6x, 2(F15.6, A), A)')                  &
-      &            '      [', s%atom(iatom)%shell(1)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(2)%Qin,'],'
-              else if (nssh .eq. 3) then
-                write (s%jsonfile,'(A, 6x, 3(F15.6, A), A)')                  &
-      &            '      [', s%atom(iatom)%shell(1)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(2)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(3)%Qin,'],'
-              else if (nssh .eq. 4) then
-                write (s%jsonfile,'(A, 6x, 4(F15.6, A), A)')                  &
-      &            '      [', s%atom(iatom)%shell(1)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(2)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(3)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(4)%Qin,'],'
-              else if (nssh .eq. 5) then
-                write (s%jsonfile,'(A, 6x, 5(F15.6, A), A)')                  &
-      &            '      [', s%atom(iatom)%shell(1)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(2)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(3)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(4)%Qin, ',',                &
-      &                       s%atom(iatom)%shell(5)%Qin,'],'
-              end if
-            end do
-            in1 = s%atom(s%natoms)%imass
-            nssh = species(in1)%nssh
-            if (nssh .eq. 1) then
-              write (s%jsonfile,'(A, 6x, (F15.6, A), A)')                     &
-      &          '      [', s%atom(s%natoms)%shell(1)%Qin,']],'
-            else if (nssh .eq. 2) then
-              write (s%jsonfile,'(A, 6x, 2(F15.6, A), A)')                    &
-      &          '      [', s%atom(s%natoms)%shell(1)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(2)%Qin,']],'
-            else if (nssh .eq. 3) then
-              write (s%jsonfile,'(A, 6x, 3(F15.6, A), A)')                    &
-      &          '      [', s%atom(s%natoms)%shell(1)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(2)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(3)%Qin,']],'
-            else if (nssh .eq. 4) then
-              write (s%jsonfile,'(A, 6x, 4(F15.6, A), A)')                    &
-      &          '      [', s%atom(s%natoms)%shell(1)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(2)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(3)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(4)%Qin,']],'
-            else if (nssh .eq. 5) then
-              write (s%jsonfile,'(A, 6x, 5(F15.6, A), A)')                    &
-      &          '      [', s%atom(s%natoms)%shell(1)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(2)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(3)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(4)%Qin, ',',               &
-      &                     s%atom(s%natoms)%shell(5)%Qin,']],'
-            end if
+            call writeout_file_charges (s, itime_step)  
             call writeout_energies (s, ebs, uii_uee, uxcdcc)
 
             ! json output for Fermi energy
-            write (s%jsonfile,'(A, F15.6, A)') '      "fermi":', efermi, ','
-
+            call writeout_file_efermi (s, efermi, itime_step)
             ! json output for energy
-            write (s%jsonfile,'(A, F15.6, A)') '      "energy":', etot, ','
-
+            call writeout_file_etot (s, etot, itime_step)
 ! ===========================================================================
 ! ---------------------------------------------------------------------------
 !                               F O R C E S
@@ -627,12 +552,18 @@
 ! ===========================================================================
             call cpu_time (time_forces_begin)
             call initialize_forces (s)
+
+            ! nonadiabatic molecular dynamics
+            call initialize_nac (s)
+            call density_matrix_nac (s)
+            call writeout_density_nac (s)  
+
             call densityPP_matrix (s)
             call cape_matrix (s)
 
 ! After building the density matrix, then we can free up the kspace memory
             call destroy_kspace (s)
-
+            
             write (s%logfile, *)
             write (s%logfile,'(A)') 'Forces '
             write (s%logfile,'(A)') '------ '
@@ -640,7 +571,9 @@
 ! Assemble the derivative blocks needed for forces
             write (s%logfile, *) ' Two-center non-charge dependent Dassemblers.'
             call Dassemble_S (s)
+            write (s%logfile, *) ' Dassemble_S NO PROBLEMS!'
             call Dassemble_T (s)
+            write (s%logfile, *) ' Dassemble_T NO PROBLEMS!'
             call Dassemble_dipole_z (s)
             call Dassemble_svnl (s)
             call Dassemble_vnl_2c (s)
@@ -671,29 +604,24 @@
 
             call build_forces (s, rms)
 
+! NAC build nonadiabatic couplings dij
+            call build_dij_nac (s)
+
 ! Add in the van der Waals energy and forces if there is an input file
             call calculate_vdW (s, vdW)
 
             if (iwriteout_forces .eq. 1) call writeout_forces (s)
-            write (s%logfile,*)
-            write (s%logfile,*) ' Total Forces:'
-            do iatom = 1, s%natoms
-              write (s%logfile, 512)  iatom, s%forces(iatom)%ftot
-            end do
+! NAC
+            if (iwriteout_dij_nac .eq. 1) call writeout_dij_nac (s)
 
             ! json output for forces
-            write (s%jsonfile,'(A)') '      "forces":['
-            do iatom = 1, s%natoms - 1
-              write (s%jsonfile,'(A, 3x, 3(F15.6, A), A)')                    &
-     &          '      [', s%forces(iatom)%ftot(1), ',',                      &
-     &                     s%forces(iatom)%ftot(2), ',',                      &
-     &                     s%forces(iatom)%ftot(3),'],'
-            end do
-            write (s%jsonfile,'(A, 3x, 3(F15.6, A), A)')                      &
-     &        '      [', s%forces(s%natoms)%ftot(1), ',',                     &
-     &                   s%forces(s%natoms)%ftot(2), ',',                     &
-     &                   s%forces(s%natoms)%ftot(3),']],'
-            write (s%jsonfile,'(A, F15.6, A)') '      "RMS":', rms
+            call writeout_file_force (s, itime_step)
+
+            call writeout_file_rms (s, rms, itime_step)
+
+            ! json output for nonadiabatic coupling vectors
+            if (iwriteout_dij_nac .eq. 1) call writeout_file_dij_nac (s, itime_step)
+
             write (s%jsonfile,'(A)') '}'
             write (s%jsonfile,'(A)') ']}'
 
@@ -704,14 +632,17 @@
             write (s%logfile, *)
             write (s%logfile, '(A)') ' Grand Total Energy '
             write (s%logfile, '(A)') ' ------------------ '
-            write (s%logfile,601) tkinetic
+            write (s%logfile,600) etot
+            write (s%logfile,601) s%md%tkinetic
             write (s%logfile,602) vdW
-            getot = etot + tkinetic + vdW
+            getot = etot + s%md%tkinetic + vdW
             write (s%logfile,603) getot
             write (s%logfile,604) getot/s%natoms
             if (itime_step .eq. nstepi) getot_initial = getot/s%natoms
 ! Check energy conservation
             write (s%logfile,605) 1000.d0*(getot/s%natoms - getot_initial)
+! NAC
+            call nonadiabatic_mdet (s, itime_step)
 
 ! ===========================================================================
 ! ---------------------------------------------------------------------------
@@ -720,9 +651,8 @@
 ! ===========================================================================
             if (ipi .eq. 1) then
               allocate (msgbuffer(3*s%natoms))
-              do while (.true.)
+              do while (.true.)                
                 call readbuffer (socket, header, msglen)
-
                 ! SOCKET - SEND FORCES
                 if (trim(header) .eq. "STATUS") then
                   call writebuffer (socket, "HAVEDATA    ", msglen)
@@ -742,10 +672,29 @@
                     call writebuffer (socket, xcell, 9)
                     call writebuffer (socket, 1)
                     call writebuffer (socket, ' ', 1)
+                    do iatom = 1, s%natoms
+                      msgbuffer(3*(iatom-1)+1:3*iatom) = s%atom(iatom)%vatom
+                    end do
+                    call writebuffer (socket, msgbuffer, 3*s%natoms)                    
                     exit
                   end if
                 end if
               end do
+
+              ! because we are using ASE, then ratom never really gets shifted
+              if (ishiftO .eq. 1) then
+                do iatom = 1, s%natoms
+                  s%atom(iatom)%ratom = s%atom(iatom)%ratom + shifter
+                end do
+              end if
+              call writeout_coodinate_velocity (s)
+              ! call writeout_kin_T (s)
+              ! call writeout_momentum (s)
+              if (ishiftO .eq. 1) then
+                do iatom = 1, s%natoms
+                  s%atom(iatom)%ratom = s%atom(iatom)%ratom - shifter
+                end do
+              end if
 
               ! SOCKET - GET POSITIONS
               do while (.true.)
@@ -766,13 +715,17 @@
                     end if
                     call readbuffer (socket, msgbuffer, 3*s%natoms)
                     do iatom = 1, s%natoms
-                     s%atom(iatom)%ratom = msgbuffer(3*(iatom-1)+1:3*iatom)*P_abohr
+                     s%atom(iatom)%ratom = msgbuffer(3*(iatom-1)+1: 3*iatom)*P_abohr
                     end do
+                    call readbuffer (socket, msgbuffer, 3*s%natoms)
+                    do iatom = 1, s%natoms
+                     s%atom(iatom)%vatom = msgbuffer(3*(iatom-1)+1: 3*iatom)
+                    end do                    
                     exit
                   end if
                 end if
-              end do
-              deallocate (msgbuffer)
+              end do  
+              deallocate (msgbuffer)    
             end if
 
             ! because we are using ASE, then ratom never really gets shifted
@@ -809,6 +762,8 @@
             call destroy_neighbors_PP (s)
             call destroy_neighbors_vdW (s)
           end do ! end molecular dynamics loop
+          ! nonadiabatic molecular dynamics
+          call destroy_mdet (s)
 
 ! ===========================================================================
 ! ---------------------------------------------------------------------------
@@ -875,8 +830,9 @@
 
 512     format (2x, 'f_total =',i6 ,3(2x,f15.6))
 
+600     format (2x, '                                 Potential Energy = ', f18.8)
 601     format (2x, '                           Nuclear Kinetic Energy = ', f18.8)
-602     format (2x, '                            van der Waal''s Energy = ', f18.8)
+602     format (2x, '                           van der Waal''s Energy = ', f18.8)
 603     format (2x, ' Grand Total Energy (Nuclear Kinetic + Potential) = ', f18.8)
 604     format (2x, '                      Grand Total Energy per Atom = ', f18.8)
 605     format (2x, '                               deltaE/atom  (meV) = ', f18.8)
